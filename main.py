@@ -6,6 +6,7 @@ from typing import TypedDict, List, Annotated
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
+# Load environment variables (.env)
 load_dotenv()
 
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -14,6 +15,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
 
+# 1. Schema Definitions
 class Task(BaseModel):
     id: int
     title: str
@@ -32,18 +34,23 @@ class State(TypedDict):
     final: str
 
 
+# 2. LLM Initialization (Gemini 3.5 Flash)
 llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash", temperature=0.7)
 
 
+# 3. Graph Nodes
 def orchestrator(state: State) -> dict:
+    print(f"[*] Orchestrator: Generating blog plan for topic: '{state['topic']}'...")
     plan = llm.with_structured_output(Plan).invoke([
         SystemMessage(content="Create a blog plan with 3-5 sections on the following topic."),
         HumanMessage(content=f"Topic: {state['topic']}"),
     ])
+    print(f"[+] Plan created: '{plan.blog_title}' with {len(plan.tasks)} sections.")
     return {"plan": plan}
 
 
 def fanout(state: State):
+    print("[*] Fanout: Dispatching workers for each section...")
     return [
         Send("worker", {"task": task, "topic": state["topic"], "plan": state["plan"]})
         for task in state["plan"].tasks
@@ -55,15 +62,16 @@ def worker(payload: dict) -> dict:
     topic = payload["topic"]
     plan = payload["plan"]
 
+    print(f"[*] Worker: Writing section '{task.title}'...")
     res = llm.invoke([
-        SystemMessage(content="Write one clean Markdown section."),
+        SystemMessage(content="Write one clean, detailed Markdown section."),
         HumanMessage(
             content=(
-                f"Blog: {plan.blog_title}\n"
+                f"Blog Title: {plan.blog_title}\n"
                 f"Topic: {topic}\n\n"
                 f"Section: {task.title}\n"
                 f"Brief: {task.brief}\n\n"
-                "Return only the section content in Markdown."
+                "Return only the section content in clean Markdown format."
             )
         ),
     ])
@@ -77,22 +85,27 @@ def worker(payload: dict) -> dict:
     else:
         section_md = str(res.content).strip()
 
+    print(f"[+] Worker: Completed section '{task.title}'")
     return {"sections": [section_md]}
 
 
 def reducer(state: State) -> dict:
+    print("[*] Reducer: Combining all sections into final blog...")
     title = state["plan"].blog_title
     body = "\n\n".join(state["sections"]).strip()
     final_md = f"# {title}\n\n{body}\n"
 
+    # Save to Markdown file
     clean_title = "".join(c if c.isalnum() or c in " _-" else "" for c in title.lower())
     filename = clean_title.strip().replace(" ", "_") + ".md"
     output_path = Path(filename)
     output_path.write_text(final_md, encoding="utf-8")
 
+    print(f"[✓] Successfully saved full blog to: {output_path.resolve()}")
     return {"final": final_md}
 
 
+# 4. Build and Compile Graph
 graph = StateGraph(State)
 graph.add_node("orchestrator", orchestrator)
 graph.add_node("worker", worker)
@@ -103,4 +116,13 @@ graph.add_conditional_edges("orchestrator", fanout, ["worker"])
 graph.add_edge("worker", "reducer")
 graph.add_edge("reducer", END)
 
-blog_app = graph.compile()
+app = graph.compile()
+
+
+# 5. Main Execution Entrypoint
+if __name__ == "__main__":
+    topic = "Write a blog on Self Attention in Transformers"
+    print(f"\n=== Starting Multi-Agent Blog Generator ===")
+    out = app.invoke({"topic": topic, "sections": []})
+    print("\n=== Blog Generated Successfully! ===")
+    print(out["final"][:500] + "\n\n... (full content saved to file) ...\n")
