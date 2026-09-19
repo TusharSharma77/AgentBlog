@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import time
 import operator
 from pathlib import Path
 from typing import TypedDict, List, Annotated
@@ -35,16 +36,34 @@ class State(TypedDict):
 
 
 # 2. LLM Initialization (Gemini 3.5 Flash)
-llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash", temperature=0.7)
+llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash", temperature=0.7, max_retries=5)
 
 
-# 3. Graph Nodes
+# 3. Graph Nodes with Exponential Backoff Retries
 def orchestrator(state: State) -> dict:
     print(f"[*] Orchestrator: Generating blog plan for topic: '{state['topic']}'...")
-    plan = llm.with_structured_output(Plan).invoke([
+    messages = [
         SystemMessage(content="Create a blog plan with 3-5 sections on the following topic."),
         HumanMessage(content=f"Topic: {state['topic']}"),
-    ])
+    ]
+    
+    plan = None
+    for attempt in range(5):
+        try:
+            plan = llm.with_structured_output(Plan).invoke(messages)
+            break
+        except Exception as e:
+            err_msg = str(e)
+            if any(code in err_msg for code in ["503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"]):
+                wait_sec = (attempt + 1) * 4
+                print(f"[*] Orchestrator: Server busy/rate-limited, retrying in {wait_sec}s (attempt {attempt+1}/5)...")
+                time.sleep(wait_sec)
+            else:
+                raise e
+
+    if plan is None:
+        raise RuntimeError("Failed to generate plan after retries.")
+
     print(f"[+] Plan created: '{plan.blog_title}' with {len(plan.tasks)} sections.")
     return {"plan": plan}
 
@@ -63,7 +82,7 @@ def worker(payload: dict) -> dict:
     plan = payload["plan"]
 
     print(f"[*] Worker: Writing section '{task.title}'...")
-    res = llm.invoke([
+    messages = [
         SystemMessage(content="Write one clean, detailed Markdown section."),
         HumanMessage(
             content=(
@@ -74,7 +93,24 @@ def worker(payload: dict) -> dict:
                 "Return only the section content in clean Markdown format."
             )
         ),
-    ])
+    ]
+
+    res = None
+    for attempt in range(5):
+        try:
+            res = llm.invoke(messages)
+            break
+        except Exception as e:
+            err_msg = str(e)
+            if any(code in err_msg for code in ["503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"]):
+                wait_sec = (attempt + 1) * 4
+                print(f"[*] Worker '{task.title}': API busy (503/429), retrying in {wait_sec}s (attempt {attempt+1}/5)...")
+                time.sleep(wait_sec)
+            else:
+                raise e
+
+    if res is None:
+        raise RuntimeError(f"Failed to generate section '{task.title}' after retries.")
 
     if hasattr(res, "text") and res.text:
         section_md = res.text.strip()
@@ -125,4 +161,7 @@ if __name__ == "__main__":
     print(f"\n=== Starting Multi-Agent Blog Generator ===")
     out = app.invoke({"topic": topic, "sections": []})
     print("\n=== Blog Generated Successfully! ===")
-    print(out["final"][:500] + "\n\n... (full content saved to file) ...\n")
+    print(f"Blog Title: {out['plan'].blog_title}")
+    print(f"Sections Count: {len(out['sections'])}")
+    print(f"Total Markdown Characters: {len(out['final'])}")
+    print("\nPreview:\n" + out["final"][:400] + "\n\n... (full content saved to file) ...\n")

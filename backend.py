@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import time
 import operator
 from pathlib import Path
 from typing import TypedDict, List, Annotated
@@ -32,14 +33,27 @@ class State(TypedDict):
     final: str
 
 
-llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash", temperature=0.7)
+llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash", temperature=0.7, max_retries=5)
 
 
 def orchestrator(state: State) -> dict:
-    plan = llm.with_structured_output(Plan).invoke([
+    messages = [
         SystemMessage(content="Create a blog plan with 3-5 sections on the following topic."),
         HumanMessage(content=f"Topic: {state['topic']}"),
-    ])
+    ]
+    plan = None
+    for attempt in range(5):
+        try:
+            plan = llm.with_structured_output(Plan).invoke(messages)
+            break
+        except Exception as e:
+            err = str(e)
+            if any(code in err for code in ["503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"]):
+                time.sleep((attempt + 1) * 4)
+            else:
+                raise e
+    if plan is None:
+        raise RuntimeError("Failed to generate plan.")
     return {"plan": plan}
 
 
@@ -55,7 +69,7 @@ def worker(payload: dict) -> dict:
     topic = payload["topic"]
     plan = payload["plan"]
 
-    res = llm.invoke([
+    messages = [
         SystemMessage(content="Write one clean Markdown section."),
         HumanMessage(
             content=(
@@ -66,7 +80,22 @@ def worker(payload: dict) -> dict:
                 "Return only the section content in Markdown."
             )
         ),
-    ])
+    ]
+
+    res = None
+    for attempt in range(5):
+        try:
+            res = llm.invoke(messages)
+            break
+        except Exception as e:
+            err = str(e)
+            if any(code in err for code in ["503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"]):
+                time.sleep((attempt + 1) * 4)
+            else:
+                raise e
+
+    if res is None:
+        raise RuntimeError(f"Failed to generate section '{task.title}'.")
 
     if hasattr(res, "text") and res.text:
         section_md = res.text.strip()
